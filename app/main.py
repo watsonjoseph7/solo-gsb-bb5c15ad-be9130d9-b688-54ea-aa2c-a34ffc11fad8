@@ -3,16 +3,22 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
+from . import auth as auth_mod
 from .config import settings
 from .db import connect, immediate_transaction, init_db
 from .privacy import derive_laplace_noise
 from .schemas import (
+    ApiKeyResponse,
+    ApiKeyRevokedResponse,
     BudgetResponse,
+    CreateApiKeyRequest,
     HealthResponse,
     ReleaseRequest,
     ReleaseResponse,
@@ -23,13 +29,19 @@ from .security import resolve_server_key
 
 app = FastAPI(
     title="Differential Privacy Budget Release API",
-    version="1.0.0",
+    version="1.1.0",
     description="Charges epsilon budgets transactionally and releases "
-    "Laplace-noised aggregates with idempotent retries.",
+    "Laplace-noised aggregates with idempotent retries. All endpoints except "
+    "/health and /docs require an X-API-Key header.",
+    redoc_url=None,
 )
 
-# Resolved once at startup: env-supplied key, or a persisted random key.
+# Resolved once at startup: env-supplied keys, or persisted random keys.
 _server_key: bytes = b""
+_admin_key: str = ""
+
+# Paths reachable without an API key (plus the Swagger UI assets the page needs).
+_PUBLIC_PATHS = frozenset({"/health", "/docs", "/openapi.json"})
 
 # Fields that must be identical when a release idempotency key is reused.
 _REPLAY_FIELDS = (
@@ -67,9 +79,86 @@ class _ReplayTransfer(Exception):
 
 @app.on_event("startup")
 def _startup() -> None:
-    global _server_key
+    global _server_key, _admin_key
     init_db()
     _server_key = resolve_server_key()
+    _admin_key = auth_mod.resolve_admin_key()
+
+
+def _unauthorized(detail: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"detail": detail},
+        headers={"WWW-Authenticate": "ApiKey"},
+    )
+
+
+def _request_principal(request: Request) -> auth_mod.Principal:
+    """Return the validated API-key principal attached by the middleware."""
+    principal = request.state.principal
+    assert isinstance(principal, auth_mod.Principal)
+    return principal
+
+
+def _require_dataset(principal: auth_mod.Principal, dataset_id: str) -> None:
+    """Scope check: the key must explicitly cover the dataset."""
+    if not principal.allows(dataset_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "dataset_out_of_scope",
+                "dataset_id": dataset_id,
+                "key_id": principal.key_id,
+            },
+        )
+
+
+def _authenticate(presented: str) -> auth_mod.Principal | None:
+    """Short WAL read resolving a presented key (off the event loop)."""
+    conn = connect()
+    try:
+        return auth_mod.authenticate_key(presented, conn)
+    finally:
+        conn.close()
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):
+    """Authenticate every request outside the public paths.
+
+    /health and /docs (plus the OpenAPI document the UI consumes) are open.
+    /auth/keys* requires the bootstrap admin token (a data-plane key there is
+    403). Everything else requires a valid, unrevoked, unexpired API key;
+    dataset-level scope is enforced inside the individual handlers.
+    """
+    path = request.url.path
+    if path in _PUBLIC_PATHS or path.startswith("/docs"):
+        return await call_next(request)
+
+    presented = request.headers.get("X-API-Key", "").strip()
+    if not presented:
+        return _unauthorized("Missing X-API-Key header")
+
+    is_admin_path = path == "/auth/keys" or path.startswith("/auth/keys/")
+    if is_admin_path:
+        if not auth_mod.authenticate_admin(presented, _admin_key):
+            if presented.startswith("dpk_"):
+                # A valid data-plane key is never an administrator.
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Administrator key required for this endpoint"},
+                )
+            return _unauthorized("Invalid API key")
+        request.state.principal = auth_mod.AdminPrincipal()
+        return await call_next(request)
+
+    # Data-plane endpoints: one short read transaction (WAL: never blocks
+    # readers, waits up to busy_timeout on concurrent writers).
+    principal = await run_in_threadpool(_authenticate, presented)
+    if principal is None:
+        return _unauthorized("Invalid, revoked or expired API key")
+    request.state.principal = principal
+    return await call_next(request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -105,6 +194,100 @@ def _validation_exception_handler(request: Request, exc: RequestValidationError)
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+# --- API key management (admin token only) ---
+
+
+@app.post(
+    "/auth/keys",
+    response_model=ApiKeyResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["auth"],
+)
+def create_api_key(payload: CreateApiKeyRequest) -> ApiKeyResponse:
+    """Mint an API key scoped to a list of datasets.
+
+    The plaintext token is returned exactly once in the ``api_key`` field;
+    only its SHA-256 hash is persisted. Requires the admin token (env
+    ``DP_ADMIN_API_KEY`` or the persisted bootstrap token) in X-API-Key.
+    """
+    if payload.ttl_seconds is not None:
+        expires_dt: datetime | None = datetime.now(timezone.utc) + timedelta(
+            seconds=payload.ttl_seconds
+        )
+    else:
+        expires_dt = payload.expires_at
+    expires_text = (
+        expires_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        if expires_dt
+        else None
+    )
+
+    # BEGIN IMMEDIATE serializes concurrent minting; retry on the (astronomically
+    # unlikely) collision of a random key id or digest.
+    for _ in range(3):
+        key_id, token, key_prefix = auth_mod.generate_api_key()
+        created_at = auth_mod.utcnow_iso()
+        try:
+            with immediate_transaction() as conn:
+                conn.execute(
+                    "INSERT INTO api_keys "
+                    "(key_id, name, key_hash, key_prefix, expires_at, revoked, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    (
+                        key_id,
+                        payload.name,
+                        auth_mod.hash_token(token),
+                        key_prefix,
+                        expires_text,
+                        created_at,
+                    ),
+                )
+                conn.executemany(
+                    "INSERT INTO api_key_scopes (key_id, dataset_id) VALUES (?, ?)",
+                    [(key_id, ds) for ds in payload.dataset_ids],
+                )
+        except sqlite3.IntegrityError:
+            continue
+        return ApiKeyResponse(
+            key_id=key_id,
+            name=payload.name,
+            api_key=token,
+            dataset_ids=list(payload.dataset_ids),
+            expires_at=expires_dt,
+            created_at=created_at,
+        )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="could not allocate a unique API key",
+    )
+
+
+@app.delete(
+    "/auth/keys/{key_id}",
+    response_model=ApiKeyRevokedResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["auth"],
+)
+def revoke_api_key(key_id: str) -> ApiKeyRevokedResponse:
+    """Revoke an API key. The hash is retained (so the token can never be
+    re-minted), but every subsequent authentication with it fails.
+
+    Unknown key ids return 404.
+    """
+    with immediate_transaction() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM api_keys WHERE key_id = ?", (key_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Unknown key_id"
+            )
+        conn.execute(
+            "UPDATE api_keys SET revoked = 1 WHERE key_id = ?", (key_id,)
+        )
+    return ApiKeyRevokedResponse(key_id=key_id, revoked=True)
 
 
 def _row_to_release(row: sqlite3.Row) -> ReleaseResponse:
@@ -156,6 +339,8 @@ def _idempotency_key(request: Request, payload: ReleaseRequest) -> str:
 def create_release(
     payload: ReleaseRequest, request: Request
 ) -> ReleaseResponse:
+    principal = _request_principal(request)
+    _require_dataset(principal, payload.dataset_id)
     idem_key = _idempotency_key(request, payload)
     total_budget = settings.budget_for(payload.dataset_id)
 
@@ -292,12 +477,17 @@ def _row_to_transfer(row: sqlite3.Row) -> TransferResponse:
     status_code=status.HTTP_200_OK,
     tags=["budgets"],
 )
-def transfer_budget(payload: TransferRequest) -> TransferResponse:
+def transfer_budget(payload: TransferRequest, request: Request) -> TransferResponse:
     """Move unused epsilon quota from one dataset to another.
 
     Both balances are read and updated inside one ``BEGIN IMMEDIATE``
     transaction; any validation failure rolls the whole transfer back.
     """
+    principal = _request_principal(request)
+    # A transfer writes both budgets, so the key must cover both datasets.
+    _require_dataset(principal, payload.source_dataset)
+    _require_dataset(principal, payload.target_dataset)
+
     source_id = payload.source_dataset
     target_id = payload.target_dataset
     total_for_source = settings.budget_for(source_id)
@@ -425,7 +615,9 @@ def transfer_budget(payload: TransferRequest) -> TransferResponse:
     response_model=BudgetResponse,
     tags=["budgets"],
 )
-def get_budget(dataset_id: str) -> BudgetResponse:
+def get_budget(dataset_id: str, request: Request) -> BudgetResponse:
+    principal = _request_principal(request)
+    _require_dataset(principal, dataset_id)
     configured_total = settings.budget_for(dataset_id)
     conn = connect()
     try:
@@ -447,3 +639,37 @@ def get_budget(dataset_id: str) -> BudgetResponse:
         used_budget=used,
         remaining_budget=total - used,
     )
+
+
+def _custom_openapi() -> dict:  # type: ignore[no-untyped-def]
+    """Annotate the schema with the X-API-Key header security scheme so the
+    Swagger UI Authorize button sends it on protected endpoints."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["components"]["securitySchemes"] = {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+        }
+    }
+    protected_methods = ("get", "post", "put", "patch", "delete")
+    for path, path_item in schema.get("paths", {}).items():
+        if path in _PUBLIC_PATHS:
+            continue
+        for method, operation in path_item.items():
+            if method in protected_methods:
+                operation.setdefault("security", []).append({"ApiKeyAuth": []})
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi

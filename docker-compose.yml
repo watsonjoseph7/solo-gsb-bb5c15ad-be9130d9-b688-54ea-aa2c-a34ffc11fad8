@@ -14,6 +14,11 @@ services:
       # Generate one with: openssl rand -hex 32
       # If unset, a random key is generated and persisted to the volume.
       DP_SERVER_KEY: "${DP_SERVER_KEY:-}"
+      # Admin token for POST/DELETE /auth/keys (sent as X-API-Key).
+      # Generate one with: openssl rand -hex 32
+      # If unset, a random admin token is generated and persisted to
+      # /data/admin.key (mode 0600); read it from the volume on first boot.
+      DP_ADMIN_API_KEY: "${DP_ADMIN_API_KEY:-}"
       DATABASE_PATH: /data/dp.db
       APP_HOST: 0.0.0.0
       APP_PORT: "8000"

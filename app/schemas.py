@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
+from typing import Optional
 from typing_extensions import Annotated
 
 from pydantic import (
@@ -10,6 +12,7 @@ from pydantic import (
     StringConstraints,
     ValidationInfo,
     field_validator,
+    model_validator,
 )
 from pydantic_core import PydanticCustomError
 
@@ -91,3 +94,76 @@ class TransferResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+# --- API keys ---
+
+KeyName = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=200, strip_whitespace=True),
+]
+
+
+class CreateApiKeyRequest(BaseModel):
+    name: KeyName = Field(..., description="Human-readable label for the key")
+    dataset_ids: list[Identifier] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Datasets this key may access; duplicates are ignored",
+    )
+    # Provide exactly one of ttl_seconds / expires_at; neither = never expires.
+    ttl_seconds: Optional[int] = Field(
+        default=None, ge=1, description="Key lifetime from creation, in seconds"
+    )
+    expires_at: Optional[datetime] = Field(
+        default=None,
+        description="UTC ISO-8601 expiry (a naive value is interpreted as UTC)",
+    )
+
+    @field_validator("dataset_ids")
+    @classmethod
+    def _dedupe_datasets(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for dataset_id in value:
+            if dataset_id not in seen:
+                seen.add(dataset_id)
+                unique.append(dataset_id)
+        return unique
+
+    @model_validator(mode="after")
+    def _expiry_options(self) -> "CreateApiKeyRequest":
+        if self.ttl_seconds is not None and self.expires_at is not None:
+            raise PydanticCustomError(
+                "mutually_exclusive_expiry",
+                "provide at most one of ttl_seconds and expires_at",
+            )
+        if self.expires_at is not None and self.expires_at.tzinfo is None:
+            # Naive timestamps are interpreted as UTC rather than rejected,
+            # which is friendlier for curl-driven callers.
+            self.expires_at = self.expires_at.replace(tzinfo=timezone.utc)
+        if self.expires_at is not None and self.expires_at <= datetime.now(timezone.utc):
+            raise PydanticCustomError(
+                "expires_at_in_past",
+                "expires_at must be in the future",
+            )
+        return self
+
+    model_config = {"extra": "forbid"}
+
+
+class ApiKeyResponse(BaseModel):
+    key_id: str
+    name: str
+    # The plaintext token. It is returned ONLY here, at creation time.
+    api_key: str = Field(..., description="Keep it safe: it is shown only once")
+    dataset_ids: list[str]
+    expires_at: Optional[datetime] = None
+    created_at: str
+
+
+class ApiKeyRevokedResponse(BaseModel):
+    key_id: str
+    revoked: bool
+

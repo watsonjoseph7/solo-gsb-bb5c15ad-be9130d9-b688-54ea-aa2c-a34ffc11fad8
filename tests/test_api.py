@@ -17,17 +17,49 @@ os.environ["DATABASE_PATH"] = str(Path(_TMP) / "test.db")
 os.environ["DP_TOTAL_BUDGET"] = "1.0"
 os.environ["DP_DATASET_BUDGETS"] = "tiny:0.5"
 os.environ["DP_SERVER_KEY"] = "unit-test-server-key"
+os.environ["DP_ADMIN_API_KEY"] = "admin-secret-test-token"
+
+ADMIN_KEY = os.environ["DP_ADMIN_API_KEY"]
 
 import uvicorn  # noqa: E402
 
 from app import main as main_module  # noqa: E402
+from app.db import connect, init_db  # noqa: E402
+
+PORT = 8765
+
+# Every dataset touched by the legacy test suite; the main data key is scoped
+# to all of them.
+_MAIN_DATASETS = [
+    "ds", "race", "idem", "idem2", "tiny",
+    "t11-src", "t11-dst", "t12-src", "t12-dst",
+    "t13-src", "t13-dst", "t13-other",
+    "t14-src", "t14-dst",
+    "t15",
+    "pool", "pool-dst",
+    "chain", "chain2", "fan", "fan2", "x", "y",
+]
+
+# Populated in setUpClass after the server starts.
+DATA_KEY: str = ""
+DATA_KEY_ID: str = ""
 
 
-def _request(method: str, path: str, body: dict | None = None, headers: dict | None = None):
+def _request(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    headers: dict | None = None,
+    api_key: str | None = "__default__",
+):
     url = f"http://127.0.0.1:{PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    if api_key == "__default__":
+        api_key = DATA_KEY
+    if api_key:
+        req.add_header("X-API-Key", api_key)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
@@ -37,7 +69,44 @@ def _request(method: str, path: str, body: dict | None = None, headers: dict | N
         return exc.code, json.loads(exc.read())
 
 
-PORT = 8765
+def _request_raw(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    headers: dict | None = None,
+    api_key: str | None = "__default__",
+):
+    url = f"http://127.0.0.1:{PORT}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    if api_key == "__default__":
+        api_key = DATA_KEY
+    if api_key:
+        req.add_header("X-API-Key", api_key)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def _create_key(
+    datasets: list[str],
+    *,
+    name: str = "test key",
+    ttl_seconds: int | None = None,
+    expires_at: str | None = None,
+    admin: str = ADMIN_KEY,
+):
+    payload: dict = {"name": name, "dataset_ids": datasets}
+    if ttl_seconds is not None:
+        payload["ttl_seconds"] = ttl_seconds
+    if expires_at is not None:
+        payload["expires_at"] = expires_at
+    return _request("POST", "/auth/keys", payload, api_key=admin)
 
 
 class ApiTests(unittest.TestCase):
@@ -53,13 +122,21 @@ class ApiTests(unittest.TestCase):
         cls.thread.start()
         for _ in range(100):
             try:
-                _request("GET", "/health")
-                return
+                _request("GET", "/health", api_key="")
+                break
             except OSError:
                 import time
 
                 time.sleep(0.1)
-        raise RuntimeError("test server failed to start")
+        else:
+            raise RuntimeError("test server failed to start")
+
+        # Bootstrapped main data key covering every legacy-test dataset.
+        global DATA_KEY, DATA_KEY_ID
+        status, body = _create_key(_MAIN_DATASETS, name="main test key")
+        assert status == 201, body
+        DATA_KEY = body["api_key"]
+        DATA_KEY_ID = body["key_id"]
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -70,6 +147,15 @@ class ApiTests(unittest.TestCase):
         status, body = _request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertEqual(body, {"status": "ok"})
+
+    def test_01b_docs_and_openapi_are_public(self) -> None:
+        status, openapi = _request("GET", "/openapi.json", api_key="")
+        self.assertEqual(status, 200)
+        self.assertEqual(openapi["components"]["securitySchemes"]["ApiKeyAuth"]["name"],
+                         "X-API-Key")
+        status, html = _request_raw("GET", "/docs", api_key="")
+        self.assertEqual(status, 200)
+        self.assertIn(b"swagger", html.lower())
 
     def test_02_release_charges_budget(self) -> None:
         status, body = _request(
@@ -470,6 +556,295 @@ class ApiTests(unittest.TestCase):
         _, x = _request("GET", "/budgets/x")
         _, y = _request("GET", "/budgets/y")
         self.assertAlmostEqual(x["remaining_budget"] + y["remaining_budget"], 2.0, places=9)
+
+    # --- API-key authentication ---
+
+    def test_21_data_endpoints_require_key(self) -> None:
+        for method, path in (
+            ("GET", "/budgets/ds"),
+            ("POST", "/releases"),
+            ("POST", "/budgets/transfer"),
+        ):
+            status, body = _request(method, path, {}, api_key="")
+            self.assertEqual(status, 401, path)
+            self.assertIn("X-API-Key", body["detail"])
+
+        status, body = _request("GET", "/budgets/ds", api_key="not-a-real-key")
+        self.assertEqual(status, 401)
+
+        # A well-shaped token with an unknown id is also rejected (and does
+        # not leak whether the id exists).
+        fake = "dpk_" + "0" * 32 + "." + "A" * 43
+        status, _ = _request("GET", "/budgets/ds", api_key=fake)
+        self.assertEqual(status, 401)
+
+    def test_22_create_key_requires_admin(self) -> None:
+        # No key at all.
+        status, _ = _request(
+            "POST", "/auth/keys",
+            {"name": "n", "dataset_ids": ["z"]}, api_key="",
+        )
+        self.assertEqual(status, 401)
+        # Wrong admin token.
+        status, _ = _request(
+            "POST", "/auth/keys",
+            {"name": "n", "dataset_ids": ["z"]}, api_key="wrong-admin",
+        )
+        self.assertEqual(status, 401)
+        # A valid data-plane key is forbidden from managing keys.
+        status, body = _request(
+            "POST", "/auth/keys",
+            {"name": "n", "dataset_ids": ["z"]}, api_key=DATA_KEY,
+        )
+        self.assertEqual(status, 403, body)
+
+    def test_23_create_key_returns_plaintext_once(self) -> None:
+        status, body = _create_key(["secret-ds"], name="scoped 23")
+        self.assertEqual(status, 201, body)
+        self.assertRegex(body["api_key"], r"^dpk_[0-9a-f]{32}\.[A-Za-z0-9_-]{43}$")
+        self.assertEqual(body["key_id"], body["api_key"].split(".")[0][len("dpk_"):])
+        self.assertEqual(body["dataset_ids"], ["secret-ds"])
+        self.assertIsNone(body["expires_at"])
+
+        # Only the hash is stored: the plaintext token never hits the DB.
+        db_path = os.environ["DATABASE_PATH"]
+        conn = connect()
+        try:
+            row = conn.execute(
+                "SELECT key_hash, key_prefix, revoked, expires_at FROM api_keys WHERE key_id = ?",
+                (body["key_id"],),
+            ).fetchone()
+            scopes = conn.execute(
+                "SELECT dataset_id FROM api_key_scopes WHERE key_id = ?",
+                (body["key_id"],),
+            ).fetchall()
+            # Force a WAL checkpoint so committed pages are in the main file.
+            for _ in range(10):
+                busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+                if not busy:
+                    break
+                import time as _time
+
+                _time.sleep(0.05)
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(len(row["key_hash"]), 64)  # sha256 hex
+        self.assertNotIn(body["api_key"], row["key_hash"])
+        self.assertEqual(row["key_prefix"], body["api_key"][:12])
+        self.assertEqual(row["revoked"], 0)
+        self.assertIsNone(row["expires_at"])
+        self.assertEqual([r["dataset_id"] for r in scopes], ["secret-ds"])
+
+        # The plaintext token is not present anywhere in the database bytes.
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = Path(db_path + suffix)
+            if not sidecar.exists():
+                continue
+            self.assertNotIn(body["api_key"].encode(), sidecar.read_bytes())
+
+    def test_24_scope_enforcement(self) -> None:
+        status, body = _create_key(["alpha"], name="alpha only")
+        self.assertEqual(status, 201, body)
+        key = body["api_key"]
+
+        release = {
+            "dataset_id": "beta", "query_id": "q", "epsilon": 0.1,
+            "sensitivity": 1.0, "true_value": 1.0, "idempotency_key": "scope-1",
+        }
+        status, body = _request("POST", "/releases", release, api_key=key)
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["detail"]["error"], "dataset_out_of_scope")
+        self.assertEqual(body["detail"]["dataset_id"], "beta")
+
+        status, body = _request("GET", "/budgets/beta", api_key=key)
+        self.assertEqual(status, 403)
+
+        # Transfer requires BOTH datasets in scope.
+        for source, target in (("alpha", "beta"), ("beta", "alpha")):
+            status, body = _request(
+                "POST", "/budgets/transfer",
+                {"transfer_id": f"tx-{source}-{target}",
+                 "source_dataset": source, "target_dataset": target,
+                 "epsilon": 0.1},
+                api_key=key,
+            )
+            self.assertEqual(status, 403, (source, target, body))
+
+        # In-scope access works.
+        release["dataset_id"] = "alpha"
+        status, body = _request("POST", "/releases", release, api_key=key)
+        self.assertEqual(status, 200, body)
+        status, body = _request("GET", "/budgets/alpha", api_key=key)
+        self.assertEqual(status, 200)
+        self.assertAlmostEqual(body["used_budget"], 0.1, places=9)
+
+        # Transfer within two in-scope datasets works.
+        status, body = _create_key(["gamma", "delta"], name="gd")
+        key2 = body["api_key"]
+        status, body = _request(
+            "POST", "/budgets/transfer",
+            {"transfer_id": "tx-gd", "source_dataset": "gamma",
+             "target_dataset": "delta", "epsilon": 0.2},
+            api_key=key2,
+        )
+        self.assertEqual(status, 200, body)
+
+    def test_25_revocation(self) -> None:
+        status, body = _create_key(["rev-ds"], name="to revoke")
+        self.assertEqual(status, 201)
+        key_id, token = body["key_id"], body["api_key"]
+
+        status, _ = _request("GET", "/budgets/rev-ds", api_key=token)
+        self.assertEqual(status, 200)
+
+        # Admin cannot use a DELETE path with a data key.
+        status, _ = _request("DELETE", f"/auth/keys/{key_id}", api_key=token)
+        self.assertEqual(status, 403)
+
+        status, body = _request("DELETE", f"/auth/keys/{key_id}", api_key=ADMIN_KEY)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {"key_id": key_id, "revoked": True})
+
+        # Immediately unusable.
+        status, _ = _request("GET", "/budgets/rev-ds", api_key=token)
+        self.assertEqual(status, 401)
+
+        # Revoking an unknown id is 404; re-revoking stays 200 (idempotent).
+        status, _ = _request("DELETE", "/auth/keys/deadbeef" * 4, api_key=ADMIN_KEY)
+        self.assertEqual(status, 404)
+        status, _ = _request("DELETE", f"/auth/keys/{key_id}", api_key=ADMIN_KEY)
+        self.assertEqual(status, 200)
+
+    def test_26_expired_key_is_rejected(self) -> None:
+        # Expiry in the past is itself a 422.
+        status, _ = _create_key(
+            ["exp-ds"], expires_at="2000-01-01T00:00:00Z", name="past"
+        )
+        self.assertEqual(status, 422)
+
+        # ttl_seconds and expires_at are mutually exclusive.
+        status, _ = _create_key(
+            ["exp-ds"], ttl_seconds=60, expires_at="2099-01-01T00:00:00Z",
+            name="both",
+        )
+        self.assertEqual(status, 422)
+
+        # A 1-second TTL works now and stops working after expiry.
+        status, body = _create_key(["exp-ds"], ttl_seconds=1, name="short")
+        self.assertEqual(status, 201, body)
+        self.assertIsNotNone(body["expires_at"])
+        token = body["api_key"]
+        status, _ = _request("GET", "/budgets/exp-ds", api_key=token)
+        self.assertEqual(status, 200)
+
+        import time
+
+        time.sleep(1.2)
+        status, body = _request("GET", "/budgets/exp-ds", api_key=token)
+        self.assertEqual(status, 401)
+
+    def test_27_create_key_validation(self) -> None:
+        bad_bodies = [
+            {"name": "", "dataset_ids": ["a"]},
+            {"name": "n", "dataset_ids": []},
+            {"name": "n", "dataset_ids": [""]},
+            {"name": "n", "dataset_ids": ["a"], "ttl_seconds": 0},
+            {"name": "n", "dataset_ids": ["a"], "extra": True},
+        ]
+        for payload in bad_bodies:
+            status, body = _request("POST", "/auth/keys", payload, api_key=ADMIN_KEY)
+            self.assertEqual(status, 422, payload)
+
+    def test_28_concurrent_key_creation_and_revocation(self) -> None:
+        """Fan-out minting must all succeed with distinct ids/tokens;
+        concurrent revokes of the same id must not error."""
+        def mint(i: int) -> tuple[int, dict]:
+            return _request(
+                "POST", "/auth/keys",
+                {"name": f"concurrent {i}", "dataset_ids": [f"cc-{i}"]},
+                api_key=ADMIN_KEY,
+            )
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(mint, range(24)))
+        self.assertTrue(all(code == 201 for code, _ in results), results)
+        ids = [body["key_id"] for _, body in results]
+        tokens = [body["api_key"] for _, body in results]
+        self.assertEqual(len(set(ids)), 24)
+        self.assertEqual(len(set(tokens)), 24)
+
+        target_id = ids[0]
+        def revoke(_i: int):
+            return _request("DELETE", f"/auth/keys/{target_id}", api_key=ADMIN_KEY)[0]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            codes = list(pool.map(revoke, range(16)))
+        self.assertEqual(set(codes), {200}, codes)
+
+        # Concurrent use of the revoked key is rejected but never 500s.
+        token = tokens[0]
+        def use(_i: int):
+            return _request("GET", "/budgets/cc-0", api_key=token)[0]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            codes = list(pool.map(use, range(16)))
+        self.assertEqual(set(codes), {401}, codes)
+
+    def test_29_wrong_secret_is_unauthorized(self) -> None:
+        status, body = _create_key(["tamper-ds"], name="tamper")
+        self.assertEqual(status, 201)
+        token = body["api_key"]
+        # Flip the last character of the secret while keeping a valid shape.
+        last = token[-1]
+        flipped = "B" if last == "A" else "A"
+        tampered = token[:-1] + flipped
+        status, _ = _request("GET", "/budgets/tamper-ds", api_key=tampered)
+        self.assertEqual(status, 401)
+
+
+class MigrationTests(unittest.TestCase):
+    """The v1 schema must upgrade in place to the key schema (user_version)."""
+
+    def test_existing_v1_database_is_upgraded(self) -> None:
+        tmp = Path(_TMP) / "migration"
+        tmp.mkdir(parents=True, exist_ok=True)
+        db_path = tmp / "old.db"
+
+        # Build a database exactly like a pre-auth deployment (version 0,
+        # v1 tables, plus a live budget row).
+        from app.db import MIGRATIONS
+
+        conn = connect(str(db_path))
+        try:
+            conn.executescript(MIGRATIONS[0].replace("PRAGMA user_version = 1;", ""))
+            conn.execute("PRAGMA user_version = 0")
+            conn.execute(
+                "INSERT INTO budgets (dataset_id, total, used) VALUES ('old-ds', 0.9, 0.1)"
+            )
+        finally:
+            conn.close()
+
+        init_db(str(db_path))
+
+        conn = connect(str(db_path))
+        try:
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 2)
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            self.assertIn("api_keys", tables)
+            self.assertIn("api_key_scopes", tables)
+            # Existing data survives the migration.
+            row = conn.execute(
+                "SELECT total, used FROM budgets WHERE dataset_id = 'old-ds'"
+            ).fetchone()
+            self.assertEqual((row["total"], row["used"]), (0.9, 0.1))
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

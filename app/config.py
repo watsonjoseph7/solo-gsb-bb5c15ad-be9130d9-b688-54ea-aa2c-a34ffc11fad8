@@ -49,6 +49,8 @@ class Settings:
     dataset_budgets: dict[str, float] = field(default_factory=dict)
     # SQLite database file location.
     database_path: str = "/data/dp.db"
+    # Admin token guarding /auth/keys. Empty => generate and persist one.
+    admin_api_key: str = ""
     host: str = "0.0.0.0"
     port: int = 8000
 
@@ -65,12 +67,14 @@ def _load_settings() -> Settings:
 
     server_key = os.getenv("DP_SERVER_KEY", "")
     database_path = os.getenv("DATABASE_PATH", "/data/dp.db")
+    admin_api_key = os.getenv("DP_ADMIN_API_KEY", "").strip()
 
     return Settings(
         server_key=server_key,
         total_budget=total_budget,
         dataset_budgets=dataset_budgets,
         database_path=database_path,
+        admin_api_key=admin_api_key,
         host=os.getenv("APP_HOST", "0.0.0.0"),
         port=int(os.getenv("APP_PORT", "8000")),
     )
