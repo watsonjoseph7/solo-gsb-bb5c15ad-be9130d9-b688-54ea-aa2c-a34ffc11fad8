@@ -1,6 +1,7 @@
 """FastAPI application: differential-privacy budget release service."""
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 
@@ -8,10 +9,13 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from . import api_keys, auth
 from .config import settings
 from .db import connect, immediate_transaction, init_db
 from .privacy import derive_laplace_noise
 from .schemas import (
+    ApiKeyCreateRequest,
+    ApiKeyResponse,
     BudgetResponse,
     HealthResponse,
     ReleaseRequest,
@@ -19,17 +23,34 @@ from .schemas import (
     TransferRequest,
     TransferResponse,
 )
-from .security import resolve_server_key
+from .security import resolve_admin_key, resolve_server_key
+
+logger = logging.getLogger("dp-api")
 
 app = FastAPI(
     title="Differential Privacy Budget Release API",
     version="1.0.0",
     description="Charges epsilon budgets transactionally and releases "
     "Laplace-noised aggregates with idempotent retries.",
+    # /docs and /openapi.json stay public; redoc is not exposed so it
+    # does not become an undocumented unauthenticated surface.
+    docs_url="/docs",
+    redoc_url=None,
 )
 
 # Resolved once at startup: env-supplied key, or a persisted random key.
 _server_key: bytes = b""
+# Bootstrap administrator API key for the /auth/keys endpoints. Resolved at
+# startup; the middleware reads it through this accessor so it can be
+# registered at import time (before the middleware stack is built).
+_admin_key: str = ""
+
+
+def _get_admin_key() -> str:
+    return _admin_key
+
+
+app.add_middleware(auth.ApiKeyAuthMiddleware, get_admin_key=_get_admin_key)
 
 # Fields that must be identical when a release idempotency key is reused.
 _REPLAY_FIELDS = (
@@ -67,9 +88,30 @@ class _ReplayTransfer(Exception):
 
 @app.on_event("startup")
 def _startup() -> None:
-    global _server_key
+    global _server_key, _admin_key
     init_db()
     _server_key = resolve_server_key()
+    _admin_key = resolve_admin_key()
+    if not settings.admin_api_key:
+        logger.warning(
+            "DP_ADMIN_API_KEY is not set; a random administrator API key was "
+            "generated and persisted next to the database (admin_api_key, mode "
+            "0600). It is required to create/revoke API keys via "
+            "POST/DELETE /auth/keys. Set DP_ADMIN_API_KEY explicitly for a "
+            "stable, retrievable credential."
+        )
+    # The middleware was registered at import time and reads the resolved
+    # administrator key lazily through _get_admin_key().
+    if not _admin_key:
+        raise RuntimeError(
+            "administrator API key is empty; set DP_ADMIN_API_KEY or make the "
+            "data directory writable so a key can be persisted"
+        )
+
+
+@app.exception_handler(auth.AuthError)
+def _auth_error_handler(request: Request, exc: auth.AuthError) -> JSONResponse:
+    return auth.error_response(exc)
 
 
 @app.exception_handler(RequestValidationError)
@@ -105,6 +147,55 @@ def _validation_exception_handler(request: Request, exc: RequestValidationError)
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+@app.post(
+    "/auth/keys",
+    response_model=ApiKeyResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["auth"],
+)
+def create_api_key(payload: ApiKeyCreateRequest, request: Request) -> ApiKeyResponse:
+    """Create a data-plane API key. Requires the administrator key.
+
+    The plaintext credential is returned exactly once (in ``api_key``);
+    only its SHA-256 hash is persisted.
+    """
+    auth.principal_from(request).require_admin()
+    try:
+        key_id, secret, scope = api_keys.create_api_key(
+            name=payload.name,
+            dataset_ids=list(payload.dataset_ids),
+            expires_at=payload.expires_at,
+            key_id=payload.key_id,
+        )
+    except api_keys.ApiKeyIdExists:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"key_id {payload.key_id!r} already exists",
+        )
+    return ApiKeyResponse(
+        key_id=key_id,
+        name=payload.name,
+        api_key=f"{key_id}.{secret}",
+        dataset_ids=scope,
+        expires_at=payload.expires_at,
+    )
+
+
+@app.delete(
+    "/auth/keys/{key_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["auth"],
+)
+def revoke_api_key(key_id: str, request: Request) -> None:
+    """Revoke an API key. Requires the administrator key."""
+    auth.principal_from(request).require_admin()
+    if not api_keys.revoke_api_key(key_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no active API key with key_id {key_id!r}",
+        )
 
 
 def _row_to_release(row: sqlite3.Row) -> ReleaseResponse:
@@ -157,6 +248,7 @@ def create_release(
     payload: ReleaseRequest, request: Request
 ) -> ReleaseResponse:
     idem_key = _idempotency_key(request, payload)
+    auth.principal_from(request).require_datasets([payload.dataset_id])
     total_budget = settings.budget_for(payload.dataset_id)
 
     try:
@@ -292,12 +384,15 @@ def _row_to_transfer(row: sqlite3.Row) -> TransferResponse:
     status_code=status.HTTP_200_OK,
     tags=["budgets"],
 )
-def transfer_budget(payload: TransferRequest) -> TransferResponse:
+def transfer_budget(payload: TransferRequest, request: Request) -> TransferResponse:
     """Move unused epsilon quota from one dataset to another.
 
     Both balances are read and updated inside one ``BEGIN IMMEDIATE``
     transaction; any validation failure rolls the whole transfer back.
     """
+    auth.principal_from(request).require_datasets(
+        [payload.source_dataset, payload.target_dataset]
+    )
     source_id = payload.source_dataset
     target_id = payload.target_dataset
     total_for_source = settings.budget_for(source_id)
@@ -425,7 +520,8 @@ def transfer_budget(payload: TransferRequest) -> TransferResponse:
     response_model=BudgetResponse,
     tags=["budgets"],
 )
-def get_budget(dataset_id: str) -> BudgetResponse:
+def get_budget(dataset_id: str, request: Request) -> BudgetResponse:
+    auth.principal_from(request).require_datasets([dataset_id])
     configured_total = settings.budget_for(dataset_id)
     conn = connect()
     try:
@@ -447,3 +543,29 @@ def get_budget(dataset_id: str) -> BudgetResponse:
         used_budget=used,
         remaining_budget=total - used,
     )
+
+
+
+# Describe the X-API-Key header in OpenAPI (enables the "Authorize"
+# button in /docs). Enforcement is the ApiKeyAuthMiddleware above;
+# /health and /docs stay public.
+def _openapi_with_security():  # type: ignore[no-untyped-def]
+    schema = _default_openapi()
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})[
+        "APIKeyHeader"
+    ] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": auth.API_KEY_HEADER,
+    }
+    for path, methods in schema.get("paths", {}).items():
+        if path == "/health":
+            continue
+        for operation in methods.values():
+            if isinstance(operation, dict):
+                operation["security"] = [{"APIKeyHeader": []}]
+    return schema
+
+
+_default_openapi = app.openapi
+app.openapi = _openapi_with_security

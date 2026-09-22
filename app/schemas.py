@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing_extensions import Annotated
 
 from pydantic import (
@@ -23,7 +24,27 @@ IdempotencyKey = Annotated[
     str,
     StringConstraints(min_length=1, max_length=128, strip_whitespace=True, pattern=_ID_PATTERN),
 ]
+# Key ids are safe path/identifier tokens; clients may supply their own.
+KeyId = Annotated[
+    str,
+    StringConstraints(
+        min_length=3, max_length=128, strip_whitespace=True, pattern=r"^[A-Za-z0-9_.\-]+$"
+    ),
+]
+KeyName = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=200, strip_whitespace=True),
+]
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+
+# A dataset id inside a key scope may also be the literal "*" (all datasets).
+ScopeDatasetId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1, max_length=128, strip_whitespace=True,
+        pattern=r"^(\*|[\w.:@\- ]+)$",
+    ),
+]
 
 
 class ReleaseRequest(BaseModel):
@@ -91,3 +112,46 @@ class TransferResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: KeyName = Field(..., description="Human-readable label for the key")
+    dataset_ids: list[ScopeDatasetId] = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Datasets this key may access; [\"*\"] grants all datasets",
+    )
+    expires_at: datetime = Field(
+        ..., description="UTC expiry time (timezone-aware ISO 8601)"
+    )
+    key_id: KeyId | None = Field(
+        default=None,
+        description="Optional caller-chosen key id; a random ak_... id otherwise",
+    )
+
+    @field_validator("expires_at")
+    @classmethod
+    def _must_expire_in_future(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise PydanticCustomError(
+                "expires_at_timezone_required",
+                "expires_at must be timezone-aware (e.g. append 'Z' for UTC)",
+            )
+        if value <= datetime.now(timezone.utc):
+            raise PydanticCustomError(
+                "expires_at_in_past",
+                "expires_at must be in the future",
+            )
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+class ApiKeyResponse(BaseModel):
+    key_id: str
+    name: str
+    # The plaintext credential. Returned exactly once; only its hash is stored.
+    api_key: str = Field(..., description="Present this as X-API-Key; shown only once")
+    dataset_ids: list[str]
+    expires_at: datetime

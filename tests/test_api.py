@@ -9,6 +9,7 @@ import unittest
 import urllib.request
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Configure environment BEFORE importing the app.
@@ -17,13 +18,31 @@ os.environ["DATABASE_PATH"] = str(Path(_TMP) / "test.db")
 os.environ["DP_TOTAL_BUDGET"] = "1.0"
 os.environ["DP_DATASET_BUDGETS"] = "tiny:0.5"
 os.environ["DP_SERVER_KEY"] = "unit-test-server-key"
+os.environ["DP_ADMIN_API_KEY"] = "unit-test-admin-key"
 
 import uvicorn  # noqa: E402
 
 from app import main as main_module  # noqa: E402
 
+ADMIN_KEY = "unit-test-admin-key"
+ADMIN_HEADERS = {"X-API-Key": ADMIN_KEY}
 
-def _request(method: str, path: str, body: dict | None = None, headers: dict | None = None):
+
+def _create_key(dataset_ids, *, name="test-key", ttl_seconds=3600):
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    ).isoformat()
+    status, body = _request(
+        "POST",
+        "/auth/keys",
+        {"name": name, "dataset_ids": list(dataset_ids), "expires_at": expires_at},
+        ADMIN_HEADERS,
+    )
+    assert status == 201, body
+    return body["api_key"]
+
+
+def _request(method, path, body=None, headers=ADMIN_HEADERS):
     url = f"http://127.0.0.1:{PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -32,40 +51,35 @@ def _request(method: str, path: str, body: dict | None = None, headers: dict | N
         req.add_header(k, v)
     try:
         with urllib.request.urlopen(req) as resp:
-            return resp.status, json.loads(resp.read())
+            raw = resp.read()
+            return resp.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+        raw = exc.read()
+        return exc.code, json.loads(raw) if raw else None
 
 
 PORT = 8765
 
+# One server for every test class in this module, started once on import.
+_config = uvicorn.Config(
+    main_module.app, host="127.0.0.1", port=PORT, log_level="error"
+)
+server = uvicorn.Server(_config)
+_server_thread = threading.Thread(target=server.run, daemon=True)
+_server_thread.start()
+for _ in range(100):
+    try:
+        _request("GET", "/health", headers={})
+        break
+    except OSError:
+        import time
+
+        time.sleep(0.1)
+else:
+    raise RuntimeError("test server failed to start")
+
 
 class ApiTests(unittest.TestCase):
-    server_started = False
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        config = uvicorn.Config(
-            main_module.app, host="127.0.0.1", port=PORT, log_level="error"
-        )
-        cls.server = uvicorn.Server(config)
-        cls.thread = threading.Thread(target=cls.server.run, daemon=True)
-        cls.thread.start()
-        for _ in range(100):
-            try:
-                _request("GET", "/health")
-                return
-            except OSError:
-                import time
-
-                time.sleep(0.1)
-        raise RuntimeError("test server failed to start")
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.server.should_exit = True
-        cls.thread.join(timeout=5)
-
     def test_01_health(self) -> None:
         status, body = _request("GET", "/health")
         self.assertEqual(status, 200)
@@ -470,6 +484,311 @@ class ApiTests(unittest.TestCase):
         _, x = _request("GET", "/budgets/x")
         _, y = _request("GET", "/budgets/y")
         self.assertAlmostEqual(x["remaining_budget"] + y["remaining_budget"], 2.0, places=9)
+
+
+
+class AuthTests(unittest.TestCase):
+    """X-API-Key authentication, scoping, revocation and expiry."""
+
+    @staticmethod
+    def _payload(dataset: str, key: str = "ak"):
+        return {
+            "dataset_id": dataset, "query_id": "q", "epsilon": 0.1,
+            "sensitivity": 1.0, "true_value": 1.0, "idempotency_key": key,
+        }
+
+    # --- public surface ---
+
+    def test_health_and_docs_need_no_key(self) -> None:
+        for path in ("/health", "/docs", "/openapi.json"):
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}")
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200, path)
+
+    def test_redoc_is_not_exposed(self) -> None:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT}/redoc",
+            headers={"X-API-Key": ADMIN_KEY},
+        )
+        try:
+            urllib.request.urlopen(req)
+            self.fail("/redoc should not be served")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 404)
+
+    def test_missing_key_is_401(self) -> None:
+        for method, path, body in (
+            ("GET", "/budgets/whatever", None),
+            ("POST", "/releases", self._payload("whatever")),
+            ("POST", "/budgets/transfer",
+             {"transfer_id": "z", "source_dataset": "a",
+              "target_dataset": "b", "epsilon": 0.1}),
+            ("POST", "/auth/keys",
+             {"name": "n", "dataset_ids": ["a"],
+              "expires_at": "2030-01-01T00:00:00+00:00"}),
+            ("DELETE", "/auth/keys/whatever", None),
+        ):
+            status, resp = _request(method, path, body, headers={})
+            self.assertEqual(status, 401, (method, path, resp))
+            self.assertEqual(resp["detail"]["error"], "missing_api_key")
+
+    def test_unknown_and_malformed_keys_are_401(self) -> None:
+        for bad in ("garbage", "ak_noseparator", ".secretonly",
+                    "ak_doesnotexist.abcdef"):
+            status, resp = _request(
+                "GET", "/budgets/whatever", headers={"X-API-Key": bad}
+            )
+            self.assertEqual(status, 401, (bad, resp))
+            self.assertEqual(resp["detail"]["error"], "invalid_api_key")
+
+    def test_wrong_secret_is_401(self) -> None:
+        key = _create_key(["auth-ws"])
+        key_id = key.split(".", 1)[0]
+        status, resp = _request(
+            "GET", "/budgets/auth-ws",
+            headers={"X-API-Key": key_id + ".not-the-secret"},
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(resp["detail"]["error"], "invalid_api_key")
+
+    # --- key management ---
+
+    def test_create_key_returns_plaintext_once(self) -> None:
+        expires = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        status, body = _request(
+            "POST", "/auth/keys",
+            {"name": "once", "dataset_ids": ["a", "b", "a"],
+             "expires_at": expires},
+            ADMIN_HEADERS,
+        )
+        self.assertEqual(status, 201, body)
+        self.assertTrue(body["key_id"].startswith("ak_"))
+        self.assertEqual(body["dataset_ids"], ["a", "b"])  # de-duplicated/sorted
+        self.assertIn(".", body["api_key"])
+        self.assertTrue(body["api_key"].startswith(body["key_id"] + "."))
+        self.assertEqual(body["name"], "once")
+        # The secret part is never returned again: there is no list/get
+        # endpoint and the stored hash is not the plaintext.
+        import sqlite3
+        conn = sqlite3.connect(os.environ["DATABASE_PATH"])
+        row = conn.execute(
+            "SELECT key_hash FROM api_keys WHERE key_id = ?",
+            (body["key_id"],),
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertNotIn(body["api_key"], row[0])
+        secret = body["api_key"].split(".", 1)[1]
+        self.assertNotIn(secret, row[0])
+        self.assertEqual(len(row[0]), 64)  # SHA-256 hex
+
+    def test_data_plane_key_cannot_manage_keys(self) -> None:
+        key = _create_key(["*"])
+        expires = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        status, resp = _request(
+            "POST", "/auth/keys",
+            {"name": "x", "dataset_ids": ["a"], "expires_at": expires},
+            headers={"X-API-Key": key},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(resp["detail"]["error"], "admin_required")
+
+    def test_create_key_validation(self) -> None:
+        for bad_body in (
+            {"name": "n", "dataset_ids": [],
+             "expires_at": "2030-01-01T00:00:00+00:00"},
+            {"name": "n", "dataset_ids": ["a"],
+             "expires_at": "2000-01-01T00:00:00+00:00"},
+            {"name": "n", "dataset_ids": ["a"],
+             "expires_at": "2030-01-01T00:00:00"},  # naive datetime
+            {"name": "n", "dataset_ids": ["a"],
+             "expires_at": "2030-01-01T00:00:00+00:00", "extra": 1},
+            {"name": "", "dataset_ids": ["a"],
+             "expires_at": "2030-01-01T00:00:00+00:00"},
+        ):
+            status, _ = _request("POST", "/auth/keys", bad_body, ADMIN_HEADERS)
+            self.assertEqual(status, 422, bad_body)
+
+    def test_duplicate_explicit_key_id_conflicts(self) -> None:
+        expires = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        body = {"name": "n", "key_id": "fixed-client-id",
+                "dataset_ids": ["a"], "expires_at": expires}
+        status, _ = _request("POST", "/auth/keys", body, ADMIN_HEADERS)
+        self.assertEqual(status, 201)
+        status, resp = _request("POST", "/auth/keys", body, ADMIN_HEADERS)
+        self.assertEqual(status, 409)
+
+    # --- scoping ---
+
+    def test_scoped_key_allows_only_its_datasets(self) -> None:
+        key = _create_key(["auth-allowed"])
+        h = {"X-API-Key": key}
+        self.assertEqual(
+            _request("GET", "/budgets/auth-allowed", headers=h)[0], 200
+        )
+        status, resp = _request("GET", "/budgets/auth-denied", headers=h)
+        self.assertEqual(status, 403)
+        self.assertEqual(resp["detail"]["error"], "dataset_out_of_scope")
+
+    def test_release_and_transfer_scope(self) -> None:
+        key = _create_key(["auth-src", "auth-dst"])
+        h = {"X-API-Key": key}
+        status, _ = _request(
+            "POST", "/releases",
+            self._payload("auth-src", "auth-k1"), headers=h)
+        self.assertEqual(status, 200)
+        status, resp = _request(
+            "POST", "/releases",
+            self._payload("auth-other", "auth-k2"), headers=h)
+        self.assertEqual(status, 403)
+        self.assertEqual(resp["detail"]["error"], "dataset_out_of_scope")
+
+        status, _ = _request(
+            "POST", "/budgets/transfer",
+            {"transfer_id": "auth-tr1", "source_dataset": "auth-src",
+             "target_dataset": "auth-dst", "epsilon": 0.1}, headers=h)
+        self.assertEqual(status, 200)
+        # Both sides must be in scope.
+        status, resp = _request(
+            "POST", "/budgets/transfer",
+            {"transfer_id": "auth-tr2", "source_dataset": "auth-src",
+             "target_dataset": "auth-other", "epsilon": 0.1}, headers=h)
+        self.assertEqual(status, 403)
+
+    def test_wildcard_scope(self) -> None:
+        key = _create_key(["*"])
+        h = {"X-API-Key": key}
+        for ds in ("auth-any-1", "auth-any-2"):
+            self.assertEqual(
+                _request("GET", f"/budgets/{ds}", headers=h)[0], 200
+            )
+
+    def test_admin_key_accesses_every_dataset(self) -> None:
+        status, _ = _request("GET", "/budgets/admin-only-ds")
+        self.assertEqual(status, 200)  # default headers carry the admin key
+
+    # --- revocation and expiry ---
+
+    def test_revoked_key_is_rejected_and_delete_idempotent(self) -> None:
+        body_expires = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        status, body = _request(
+            "POST", "/auth/keys",
+            {"name": "rev", "dataset_ids": ["auth-rev"],
+             "expires_at": body_expires},
+            ADMIN_HEADERS,
+        )
+        self.assertEqual(status, 201, body)
+        key = body["api_key"]
+        key_id = body["key_id"]
+        h = {"X-API-Key": key}
+        self.assertEqual(_request("GET", "/budgets/auth-rev", headers=h)[0], 200)
+        self.assertEqual(
+            _request("DELETE", f"/auth/keys/{key_id}", headers=ADMIN_HEADERS)[0],
+            204,
+        )
+        status, resp = _request("GET", "/budgets/auth-rev", headers=h)
+        self.assertEqual(status, 401)
+        self.assertEqual(resp["detail"]["error"], "key_revoked")
+        # Revoking an unknown/already-revoked key is 404.
+        self.assertEqual(
+            _request("DELETE", f"/auth/keys/{key_id}", headers=ADMIN_HEADERS)[0],
+            404,
+        )
+        self.assertEqual(
+            _request("DELETE", "/auth/keys/never-existed",
+                     headers=ADMIN_HEADERS)[0],
+            404,
+        )
+
+    def test_expired_key_is_rejected(self) -> None:
+        # 2-second TTL; wait out the expiry.
+        key = _create_key(["auth-exp"], ttl_seconds=2)
+        h = {"X-API-Key": key}
+        self.assertEqual(_request("GET", "/budgets/auth-exp", headers=h)[0], 200)
+        import time
+        time.sleep(2.2)
+        status, resp = _request("GET", "/budgets/auth-exp", headers=h)
+        self.assertEqual(status, 401)
+        self.assertEqual(resp["detail"]["error"], "key_expired")
+
+    # --- SQLite concurrency ---
+
+    def test_concurrent_key_creation(self) -> None:
+        """Many parallel creates all succeed and yield unique credentials."""
+        expires = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+
+        def create(i):
+            return _request(
+                "POST", "/auth/keys",
+                {"name": f"cc-{i}", "dataset_ids": [f"cc-{i}"],
+                 "expires_at": expires},
+                ADMIN_HEADERS,
+            )
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(create, range(24)))
+        self.assertTrue(all(code == 201 for code, _ in results), results)
+        ids = [body["key_id"] for _, body in results]
+        secrets_ = [body["api_key"] for _, body in results]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(secrets_), len(set(secrets_)))
+        # Every credential authenticates and only sees its own dataset.
+        for _, body in results:
+            h = {"X-API-Key": body["api_key"]}
+            self.assertEqual(
+                _request("GET", f"/budgets/{body['dataset_ids'][0]}",
+                         headers=h)[0],
+                200,
+            )
+
+    def test_concurrent_revocation_single_success(self) -> None:
+        key = _create_key(["auth-race-revoke"])
+        key_id = key.split(".", 1)[0]
+
+        def revoke(_i):
+            return _request(
+                "DELETE", f"/auth/keys/{key_id}", headers=ADMIN_HEADERS
+            )[0]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            codes = list(pool.map(revoke, range(16)))
+        # Exactly one DELETE marks the key revoked; the rest get 404.
+        self.assertEqual(codes.count(204), 1, codes)
+        self.assertEqual(codes.count(404), 15, codes)
+        status, resp = _request(
+            "GET", "/budgets/auth-race-revoke", headers={"X-API-Key": key}
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(resp["detail"]["error"], "key_revoked")
+
+    def test_concurrent_requests_with_one_key(self) -> None:
+        """Authenticating fan-out reads never block on each other (WAL)."""
+        key = _create_key(["auth-fan"])
+        h = {"X-API-Key": key}
+
+        def call(i):
+            return _request(
+                "POST", "/releases",
+                self._payload("auth-fan", f"auth-fan-{i}"), headers=h
+            )[0]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            codes = list(pool.map(call, range(16)))
+        # Budget 1.0, each 0.1 -> ten succeed, six get 402; none get 401/403.
+        self.assertEqual(sorted(codes).count(200), 10, codes)
+        self.assertNotIn(401, codes)
+        self.assertNotIn(403, codes)
+
 
 
 if __name__ == "__main__":

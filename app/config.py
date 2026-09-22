@@ -45,6 +45,9 @@ class Settings:
     server_key: str
     # Default total epsilon budget applied to every dataset without an override.
     total_budget: float
+    # Administrator API key allowed to create/revoke data-plane API keys.
+    # When empty a random key is generated once and persisted next to the DB.
+    admin_api_key: str = ""
     # Optional dataset-specific total budgets.
     dataset_budgets: dict[str, float] = field(default_factory=dict)
     # SQLite database file location.
@@ -64,10 +67,12 @@ def _load_settings() -> Settings:
     dataset_budgets = _parse_dataset_budgets(os.getenv("DP_DATASET_BUDGETS", ""))
 
     server_key = os.getenv("DP_SERVER_KEY", "")
+    admin_api_key = os.getenv("DP_ADMIN_API_KEY", "")
     database_path = os.getenv("DATABASE_PATH", "/data/dp.db")
 
     return Settings(
         server_key=server_key,
+        admin_api_key=admin_api_key,
         total_budget=total_budget,
         dataset_budgets=dataset_budgets,
         database_path=database_path,

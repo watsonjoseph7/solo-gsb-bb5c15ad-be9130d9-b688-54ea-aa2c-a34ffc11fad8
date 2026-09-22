@@ -46,6 +46,18 @@ CREATE TABLE IF NOT EXISTS transfers (
 
 CREATE INDEX IF NOT EXISTS idx_transfers_source ON transfers(source_dataset);
 CREATE INDEX IF NOT EXISTS idx_transfers_target ON transfers(target_dataset);
+
+-- API keys authenticate callers. Only the SHA-256 hash of the secret is
+-- stored; the plaintext is returned exactly once at creation.
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_id       TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    key_hash      TEXT NOT NULL UNIQUE,
+    scope_json    TEXT NOT NULL DEFAULT '[]',
+    expires_at    TEXT,
+    revoked       INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 
